@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.2](https://github.com/djm204/frankenbeast/compare/franken-web-v0.13.1...franken-web-v0.13.2) (2026-08-09)
+
+
+### Bug Fixes
+
+* **web:** retire legacy Smart Swarm dashboard ([#4137](https://github.com/djm204/frankenbeast/issues/4137)) ([d19e7be](https://github.com/djm204/frankenbeast/commit/d19e7be8ba591de0c996ab5ec46ec5adfb54e513))
+
 ## [0.13.1](https://github.com/djm204/frankenbeast/compare/franken-web-v0.13.0...franken-web-v0.13.1) (2026-07-31)
 
 
