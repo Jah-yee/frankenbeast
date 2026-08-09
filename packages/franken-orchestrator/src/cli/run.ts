@@ -9,6 +9,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { accessSync, constants, existsSync, lstatSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
+import { filterSecretEnvVars } from '../security/env-filter.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs, printUsage } from './args.js';
 import type { CliArgs } from './args.js';
@@ -72,7 +73,7 @@ import { TransportSecurityService } from '../http/security/transport-security.js
 import { CommsConfigSchema, type CommsConfig } from '../comms/config/comms-config.js';
 import { assertLocalPlaintextOrSecureHttpUrl, localPlaintextOrSecureEndpoint } from '../network/network-url.js';
 import { loadRunConfigFromEnv, type RunConfig } from './run-config-loader.js';
-import { resolveProviderCatalogEntry, resolveProviderType, type ProviderConfig } from '../providers/provider-config.js';
+import { resolveProviderCatalogEntry, resolveProviderType, resolveWizardExecutionProvider, type ProviderConfig } from '../providers/provider-config.js';
 import type { ProviderRegistry as LlmProviderRegistry } from '../providers/provider-registry.js';
 import { redactLogData } from '../logging/redaction.js';
 import type { NetworkServiceHealthStatus } from '../network/network-health.js';
@@ -670,13 +671,17 @@ export function buildDashboardProviderSnapshot(
   extraProviderNames: readonly string[] = [],
 ): DashboardProviderSnapshot[] {
   if (config.consolidatedProviders?.length) {
-    return config.consolidatedProviders.map((provider, index) => ({
-      name: provider.name,
-      type: provider.type,
-      available: resolveDashboardProviderAvailability(provider.name, provider.type, config),
-      failoverOrder: index,
-      ...(provider.model ? { model: provider.model } : {}),
-    }));
+    return config.consolidatedProviders.map((provider, index) => {
+      const executionProvider = resolveWizardExecutionProvider(provider.name, config.consolidatedProviders);
+      return {
+        name: provider.name,
+        type: provider.type,
+        available: resolveDashboardProviderAvailability(provider.name, provider.type, config),
+        failoverOrder: index,
+        ...(provider.model ? { model: provider.model } : {}),
+        ...(executionProvider ? { executionProvider } : {}),
+      };
+    });
   }
 
   const registryProviders = providerRegistry?.getProviders() ?? [];
@@ -714,12 +719,14 @@ export function buildDashboardProviderSnapshot(
     const registryProvider = registryByName.get(name);
     const type: string = registryProvider?.type ?? resolveDashboardProviderType(name, registryProviders[index]?.type);
     const model = config.providers.overrides?.[name]?.model;
+    const executionProvider = resolveWizardExecutionProvider(name, config.consolidatedProviders);
     return {
       name,
       type,
       available: resolveDashboardProviderAvailability(name, type, config),
       failoverOrder: index,
       ...(model ? { model } : {}),
+      ...(executionProvider ? { executionProvider } : {}),
     };
   });
 }
@@ -753,7 +760,13 @@ function scheduleDashboardCommandHealthProbe(command: string): void {
     checking: true,
   });
   try {
-    const proc = spawn(command, ['--version'], { stdio: 'ignore', timeout: 5_000 });
+    const proc = spawn(command, ['--version'], {
+      stdio: 'ignore',
+      timeout: 5_000,
+      // A --version probe never needs to authenticate, so no provider auth
+      // exemption — just strip anything secret-shaped from the ambient env.
+      env: filterSecretEnvVars(process.env as Record<string, string>),
+    });
     const finish = (available: boolean) => {
       dashboardCommandHealthCache.set(command, { available, checkedAt: Date.now(), checking: false });
     };

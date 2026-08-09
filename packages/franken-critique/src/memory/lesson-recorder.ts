@@ -30,6 +30,7 @@ import type {
   LessonScopeKind,
   LessonScopeMetadata,
   LessonScopeProvenance,
+  LessonScopeSnapshot,
   PostTaskLessonCandidate,
   PostTaskLessonDestination,
   PostTaskLessonEvidence,
@@ -46,6 +47,9 @@ const LESSON_TRACEABILITY_VERIFICATION_COMMAND =
   'npm run test --workspace @franken/critique -- --run tests/unit/memory/lesson-recorder.test.ts';
 const LESSON_CONTRADICTION_VERIFICATION_COMMAND =
   LESSON_TRACEABILITY_VERIFICATION_COMMAND;
+const LESSON_RECORD_FAILURE_CODE = 'CRITIQUE_LESSON_RECORD_FAILED';
+const LESSON_RECORD_FAILURE_GUIDANCE =
+  'Inspect the memory adapter and retry the critique run after persistence recovers.';
 
 const DEFAULT_LESSON_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const MAX_LESSON_COOLDOWN_MS = 100 * 365 * 24 * 60 * 60 * 1000;
@@ -465,15 +469,6 @@ export function updateLessonScope(
   const actor = requireNonEmptyString(request.actor, 'scope reviewer actor');
   const reason = requireNonEmptyString(request.reason, 'scope review reason');
   const scope = normalizeLessonScopeKind(request.scope);
-  const auditEntry: LessonScopeAuditEntry = {
-    changedAt,
-    actor,
-    ...(lesson.lessonScope?.scope !== undefined
-      ? { fromScope: lesson.lessonScope.scope }
-      : {}),
-    toScope: scope,
-    reason,
-  };
   const clearedAllowlists = new Set(request.clearAllowlists ?? []);
   const allowedRepos = resolveReviewedAllowlist(
     request.allowedRepos,
@@ -496,6 +491,27 @@ export function updateLessonScope(
     clearedAllowlists.has('tasks'),
   );
   const expiresAt = request.expiresAt ?? lesson.lessonScope?.expiresAt;
+  const toSnapshot = createLessonScopeSnapshot({
+    scope,
+    ...(allowedRepos !== undefined ? { allowedRepos } : {}),
+    ...(allowedRoles !== undefined ? { allowedRoles } : {}),
+    ...(allowedProfiles !== undefined ? { allowedProfiles } : {}),
+    ...(allowedTasks !== undefined ? { allowedTasks } : {}),
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+  });
+  const auditEntry: LessonScopeAuditEntry = {
+    changedAt,
+    actor,
+    ...(lesson.lessonScope !== undefined
+      ? {
+          fromScope: lesson.lessonScope.scope,
+          fromSnapshot: createLessonScopeSnapshot(lesson.lessonScope),
+        }
+      : {}),
+    toScope: scope,
+    reason,
+    toSnapshot,
+  };
   const lessonScope = createLessonScopeMetadata({
     scope,
     ...(allowedRepos !== undefined ? { allowedRepos } : {}),
@@ -2093,7 +2109,13 @@ export class LessonRecorder {
             admittedBaseLesson.timestamp,
           ),
         };
-        await this.memory.recordLesson(admittedLesson);
+        try {
+          await this.memory.recordLesson(admittedLesson);
+        } catch {
+          admissionSettled?.(false);
+          reportLessonRecordingFailure(admittedLesson);
+          return;
+        }
         recordingResult.recorded += 1;
         this.commitFailureClusterObservation(admittedLesson, recordingResult);
         this.commitBlockerPatternObservations(lesson);
@@ -2114,7 +2136,6 @@ export class LessonRecorder {
         admissionSettled?.(true);
       } catch {
         admissionSettled?.(false);
-        // Non-fatal: log failure but don't disrupt the critique flow
       } finally {
         if (
           cooldownKey &&
@@ -2708,6 +2729,46 @@ interface LessonScopeMetadataInput {
   readonly auditTrail: readonly LessonScopeAuditEntry[];
 }
 
+type LessonScopeSnapshotInput = Omit<
+  LessonScopeMetadataInput,
+  'provenance' | 'auditTrail'
+>;
+
+function createLessonScopeSnapshot(
+  input: LessonScopeSnapshotInput,
+): LessonScopeSnapshot {
+  const snapshot: LessonScopeSnapshot = {
+    scope: normalizeLessonScopeKind(input.scope),
+    ...(input.allowedRepos !== undefined
+      ? { allowedRepos: normalizeScopeList(input.allowedRepos, 'allowedRepos') }
+      : {}),
+    ...(input.allowedRoles !== undefined
+      ? { allowedRoles: normalizeScopeList(input.allowedRoles, 'allowedRoles') }
+      : {}),
+    ...(input.allowedProfiles !== undefined
+      ? {
+          allowedProfiles: normalizeScopeList(
+            input.allowedProfiles,
+            'allowedProfiles',
+          ),
+        }
+      : {}),
+    ...(input.allowedTasks !== undefined
+      ? {
+          allowedTasks: normalizeScopeList(
+            input.allowedTasks,
+            'allowedTasks',
+          ) as TaskId[],
+        }
+      : {}),
+    ...(input.expiresAt !== undefined
+      ? { expiresAt: normalizeTimestamp(input.expiresAt) }
+      : {}),
+  };
+  assertScopeHasRequiredAllowlist(snapshot);
+  return snapshot;
+}
+
 function createLessonScopeMetadata(
   input: LessonScopeMetadataInput,
 ): LessonScopeMetadata {
@@ -2750,6 +2811,12 @@ function createLessonScopeMetadata(
       ...(entry.fromScope !== undefined
         ? { fromScope: normalizeLessonScopeKind(entry.fromScope) }
         : {}),
+      ...(entry.fromSnapshot !== undefined
+        ? { fromSnapshot: createLessonScopeSnapshot(entry.fromSnapshot) }
+        : {}),
+      ...(entry.toSnapshot !== undefined
+        ? { toSnapshot: createLessonScopeSnapshot(entry.toSnapshot) }
+        : {}),
     })),
   };
   assertScopeHasRequiredAllowlist(metadata);
@@ -2784,7 +2851,7 @@ function normalizeScopeList(
   return Array.from(new Set(normalized)).sort();
 }
 
-function assertScopeHasRequiredAllowlist(scope: LessonScopeMetadata): void {
+function assertScopeHasRequiredAllowlist(scope: LessonScopeSnapshot): void {
   if (scope.scope === 'repo' && (scope.allowedRepos?.length ?? 0) === 0) {
     throw new RangeError(
       'Repo-scoped lessons require at least one allowed repo.',
@@ -4443,6 +4510,25 @@ function findRedactionSpans(
 
 function stableHash(value: string): string {
   return createHash('sha256').update(value).digest('base64url');
+}
+
+function reportLessonRecordingFailure(lesson: CritiqueLesson): void {
+  const lessonId =
+    lesson.testTraceability?.[0]?.lessonId ??
+    `${lesson.taskId}\u0000${lesson.evaluatorName}`;
+  try {
+    console.warn('Lesson recording failed', {
+      code: LESSON_RECORD_FAILURE_CODE,
+      operation: 'memory.recordLesson',
+      taskIdHash: stableHash(lesson.taskId).slice(0, 16),
+      lessonIdHash: stableHash(lessonId).slice(0, 16),
+      evaluatorNameHash: stableHash(lesson.evaluatorName).slice(0, 16),
+      retryable: true,
+      guidance: LESSON_RECORD_FAILURE_GUIDANCE,
+    });
+  } catch {
+    // Diagnostic output is best-effort so persistence failures remain non-fatal.
+  }
 }
 
 function sanitizeLessonIdPart(value: string): string {

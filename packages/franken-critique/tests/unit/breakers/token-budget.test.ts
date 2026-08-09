@@ -168,46 +168,57 @@ describe('TokenBudgetBreaker', () => {
       });
       expect(result.tripped).toBe(false);
     });
-  });
 
-  describe('configuration validation (Issue #3666)', () => {
-    it('throws ConfigurationError when tokenBudget is undefined, NaN, or <= 0', async () => {
-      const breaker = new TokenBudgetBreaker(createMockObservabilityPort(100));
-
+    // Regression for #3843: a non-finite costBudgetUsd (e.g. Infinity) silently
+    // disabled cost-budget enforcement, since `spend.estimatedCostUsd > Infinity`
+    // never trips. Reject non-finite / negative values up front instead.
+    it('rejects with ConfigurationError when costBudgetUsd is Infinity', async () => {
+      const breaker = new TokenBudgetBreaker(createMockObservabilityPort(1_000_000_000));
       await expect(
-        breaker.check(createState(1), createConfig(undefined as unknown as number)),
-      ).rejects.toThrow('tokenBudget must be a finite positive number');
-
-      await expect(
-        breaker.check(createState(1), createConfig(NaN)),
-      ).rejects.toThrow('tokenBudget must be a finite positive number');
-
-      await expect(
-        breaker.check(createState(1), createConfig(0)),
-      ).rejects.toThrow('tokenBudget must be a finite positive number');
-
-      await expect(
-        breaker.check(createState(1), createConfig(-50)),
-      ).rejects.toThrow('tokenBudget must be a finite positive number');
+        breaker.check(createState(1), {
+          ...createConfig(Number.POSITIVE_INFINITY),
+          costBudgetUsd: Number.POSITIVE_INFINITY,
+        }),
+      ).rejects.toThrow(ConfigurationError);
     });
 
-    it('throws ConfigurationError when costBudgetUsd is specified but is NaN or negative', async () => {
-      const breaker = new TokenBudgetBreaker(createMockObservabilityPort(100));
-
+    it('rejects with ConfigurationError when costBudgetUsd is -Infinity', async () => {
+      const breaker = new TokenBudgetBreaker(createMockObservabilityPort(0));
       await expect(
         breaker.check(createState(1), {
           ...createConfig(10000),
-          costBudgetUsd: NaN,
+          costBudgetUsd: Number.NEGATIVE_INFINITY,
         }),
-      ).rejects.toThrow('costBudgetUsd must be a finite non-negative number');
+      ).rejects.toThrow(ConfigurationError);
+    });
 
+    it('rejects with ConfigurationError when costBudgetUsd is NaN', async () => {
+      const breaker = new TokenBudgetBreaker(createMockObservabilityPort(0));
       await expect(
         breaker.check(createState(1), {
           ...createConfig(10000),
-          costBudgetUsd: -5,
+          costBudgetUsd: Number.NaN,
         }),
-      ).rejects.toThrow('costBudgetUsd must be a finite non-negative number');
+      ).rejects.toThrow(ConfigurationError);
+    });
+
+    it('rejects with ConfigurationError when costBudgetUsd is negative', async () => {
+      const breaker = new TokenBudgetBreaker(createMockObservabilityPort(0));
+      await expect(
+        breaker.check(createState(1), {
+          ...createConfig(10000),
+          costBudgetUsd: -1,
+        }),
+      ).rejects.toThrow(ConfigurationError);
+    });
+
+    it('does not reject a valid finite non-negative costBudgetUsd', async () => {
+      const breaker = new TokenBudgetBreaker(createMockObservabilityPort(0));
+      const result = await breaker.check(createState(1), {
+        ...createConfig(10000),
+        costBudgetUsd: 5,
+      });
+      expect(result.tripped).toBe(false);
     });
   });
 });
-
